@@ -8,8 +8,44 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 import warnings
+import time
 
 warnings.filterwarnings('ignore')
+
+# ================= HELPER FUNCTIONS =================
+# FIXED: Add safe_float() helper to handle type conversions safely
+def safe_float(value, default=0.0):
+    """
+    Safely convert any value to Python float.
+    Handles Series, numpy scalars, None, NaN, etc.
+    """
+    try:
+        # If it's a pandas Series, extract scalar
+        if isinstance(value, pd.Series):
+            if len(value) == 0:
+                return default
+            value = value.iloc[0]
+        
+        # If it's a numpy array, extract first element
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            value = value.flat[0]
+        
+        # If it has .item() method (numpy scalar), use it
+        if hasattr(value, 'item'):
+            value = value.item()
+        
+        # Handle None and NaN
+        if value is None:
+            return default
+        if pd.isna(value):
+            return default
+        
+        # Convert to float
+        return float(value)
+    except (TypeError, ValueError, AttributeError):
+        return default
 
 # ================= PAGE CONFIG =================
 st.set_page_config(
@@ -43,7 +79,7 @@ body, .stApp {
 
 .metric-card {
     background: linear-gradient(135deg, #1c1f26 0%, #161b22 100%);
-    padding: 25px;
+    padding: 20px;
     border-radius: 12px;
     border: 1px solid #30363d;
     text-align: center;
@@ -60,8 +96,8 @@ body, .stApp {
 .section-title {
     font-size: 22px;
     font-weight: 600;
-    margin-top: 30px;
-    margin-bottom: 20px;
+    margin-top: 50px;
+    margin-bottom: 50px;
     padding-bottom: 12px;
     border-bottom: 2px solid #00d9ff;
     color: #00d9ff;
@@ -167,36 +203,87 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 # ================= DATA FETCHING =================
+# FIXED: Add retry logic (3+ retries) and disable threading
 @st.cache_data(ttl=3600)
-def fetch_data(days):
-    """Fetch Bitcoin data from yfinance with proper error handling."""
-    try:
-        end = datetime.now()
-        start = end - timedelta(days=days)
-        df = yf.download("BTC-USD", start=start, end=end, progress=False)
+def fetch_data(days, max_retries=3, backoff_factor=2):
+    """Fetch Bitcoin data from yfinance with retry logic and proper error handling."""
+    retry_count = 0
+    last_error = None
+    
+    while retry_count < max_retries:
+        try:
+            end = datetime.now()
+            start = end - timedelta(days=days)
+            
+            # FIXED: Set threads=False to avoid threading issues with yfinance
+            df = yf.download(
+                "BTC-USD", 
+                start=start, 
+                end=end, 
+                progress=False,
+                threads=False  # FIXED: Disable threading to prevent API issues
+            )
+            
+            # FIXED: Handle empty DataFrame safely
+            if df is None or df.empty:
+                st.warning("No data retrieved from Yahoo Finance. Retrying...")
+                retry_count += 1
+                time.sleep(backoff_factor ** retry_count)
+                continue
+            
+            # FIXED: Ensure we have proper data structure
+            if isinstance(df.index, pd.MultiIndex):
+                df.reset_index(inplace=True)
+            elif 'Date' not in df.columns and hasattr(df.index, 'name') and df.index.name == 'Date':
+                df.reset_index(inplace=True)
+            
+            # FIXED: Ensure Close column is 1D (handle multi-index cases)
+            if isinstance(df.get('Close'), pd.DataFrame):
+                df['Close'] = df['Close'].iloc[:, 0]
+            
+            # Convert numeric columns to proper float64 type
+            dtype_map = {}
+            for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
+                if col in df.columns:
+                    dtype_map[col] = 'float64'
+            
+            if dtype_map:
+                df = df.astype(dtype_map)
+            
+            # FIXED: Remove rows with NaN prices
+            df = df.dropna(subset=['Close'])
+            
+            if len(df) < 20:  # Need minimum data points
+                st.warning(f"Insufficient data points ({len(df)}). Retrying...")
+                retry_count += 1
+                time.sleep(backoff_factor ** retry_count)
+                continue
+            
+            return df
         
-        if df.empty:
+        except yf.utils.TickerMissingError:
+            st.error("Invalid ticker symbol")
             return None
-        
-        df.reset_index(inplace=True)
-        
-        # Convert only columns that exist
-        dtype_map = {}
-        for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
-            if col in df.columns:
-                dtype_map[col] = 'float64'
-        
-        if dtype_map:
-            df = df.astype(dtype_map)
-        
-        return df
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return None
+        except Exception as e:
+            last_error = e
+            retry_count += 1
+            if retry_count < max_retries:
+                wait_time = backoff_factor ** retry_count
+                st.warning(f"API error (attempt {retry_count}/{max_retries}): {str(e)[:100]}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                st.error(f"Failed to fetch data after {max_retries} retries: {last_error}")
+                return None
+    
+    return None
 
 # ================= TECHNICAL INDICATORS =================
+# FIXED: Add better error handling and ensure proper NaN handling
 def calculate_indicators(data):
     """Calculate technical indicators with proper numpy handling."""
+    if data is None or data.empty:
+        return None
+    
     df = data.copy()
     
     try:
@@ -216,8 +303,8 @@ def calculate_indicators(data):
         df['Signal_Line'] = macd_result['signal_line']
         df['MACD_Histogram'] = macd_result['histogram']
         
-        # Fill NaN values
-        df = df.fillna(method='bfill').fillna(method='ffill')
+        # FIXED: Use proper NaN handling (fillna with method parameter deprecated in newer pandas)
+        df = df.bfill().ffill()  # backward fill then forward fill
         
         return df
     except Exception as e:
@@ -225,39 +312,72 @@ def calculate_indicators(data):
         return data
 
 def calculate_rsi(prices, period=14):
-    """Calculate Relative Strength Index."""
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    """Calculate Relative Strength Index with proper error handling."""
+    try:
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        
+        # FIXED: Avoid division by zero
+        rs = gain / loss.replace(0, 1e-10)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    except Exception as e:
+        st.warning(f"Error calculating RSI: {e}")
+        return prices * 0 + 50  # Return neutral RSI
 
 def calculate_macd(prices, fast=12, slow=26, signal=9):
-    """Calculate MACD indicator."""
-    ema_fast = prices.ewm(span=fast).mean()
-    ema_slow = prices.ewm(span=slow).mean()
-    macd = ema_fast - ema_slow
-    signal_line = macd.ewm(span=signal).mean()
-    histogram = macd - signal_line
-    
-    return {
-        'macd': macd,
-        'signal_line': signal_line,
-        'histogram': histogram
-    }
+    """Calculate MACD indicator with error handling."""
+    try:
+        ema_fast = prices.ewm(span=fast).mean()
+        ema_slow = prices.ewm(span=slow).mean()
+        macd = ema_fast - ema_slow
+        signal_line = macd.ewm(span=signal).mean()
+        histogram = macd - signal_line
+        
+        return {
+            'macd': macd,
+            'signal_line': signal_line,
+            'histogram': histogram
+        }
+    except Exception as e:
+        st.warning(f"Error calculating MACD: {e}")
+        return {
+            'macd': prices * 0,
+            'signal_line': prices * 0,
+            'histogram': prices * 0
+        }
 
 # ================= FEATURE ENGINEERING =================
+# FIXED: Use safe_float() for proper type conversions and handle edge cases
 def prepare_features(data, window=10):
     """Prepare features for ML model with proper type handling."""
+    if data is None or data.empty:
+        return None, None
+    
     try:
-        close = data['Close'].values.astype(np.float64)
+        # FIXED: Ensure Close is 1D array
+        close_values = data['Close'].values
+        if isinstance(close_values, pd.DataFrame):
+            close_values = close_values.iloc[:, 0].values
+        close = np.array([safe_float(v) for v in close_values.flat], dtype=np.float64)
         
-        # Handle volume column - use 1.0 if not available
+        # FIXED: Handle Volume column - use 1.0 if not available
         if 'Volume' in data.columns:
-            volume = data['Volume'].values.astype(np.float64)
+            volume_values = data['Volume'].values
+            if isinstance(volume_values, pd.DataFrame):
+                volume_values = volume_values.iloc[:, 0].values
+            volume = np.array([safe_float(v) for v in volume_values.flat], dtype=np.float64)
         else:
             volume = np.ones(len(close), dtype=np.float64)
+        
+        # FIXED: Remove NaN/Inf values
+        valid_idx = np.isfinite(close) & np.isfinite(volume)
+        close = close[valid_idx]
+        volume = volume[valid_idx]
+        
+        if len(close) < window + 2:
+            return None, None
         
         X, y = [], []
         
@@ -265,18 +385,17 @@ def prepare_features(data, window=10):
             cw = close[i:i+window]
             vol = volume[i:i+window]
             
-            # Use .item() to ensure proper conversion from numpy scalar to Python scalar
-            mean_price = float(np.mean(cw).item() if hasattr(np.mean(cw), 'item') else np.mean(cw))
-            std_price = float(np.std(cw).item() if hasattr(np.std(cw), 'item') else np.std(cw))
-            max_price = float(np.max(cw).item() if hasattr(np.max(cw), 'item') else np.max(cw))
-            min_price = float(np.min(cw).item() if hasattr(np.min(cw), 'item') else np.min(cw))
-            mean_vol = float(np.mean(vol).item() if hasattr(np.mean(vol), 'item') else np.mean(vol))
+            # FIXED: Use safe_float() for all conversions
+            mean_price = safe_float(np.mean(cw))
+            std_price = safe_float(np.std(cw))
+            max_price = safe_float(np.max(cw))
+            min_price = safe_float(np.min(cw))
+            mean_vol = safe_float(np.mean(vol))
             
-            # Percentage change - use .item() for scalar conversion
-            start_price = float(cw[0].item() if hasattr(cw[0], 'item') else cw[0])
-            end_price = float(close[i+window].item() if hasattr(close[i+window], 'item') else close[i+window])
-            
-            pct_change = ((end_price - start_price) / start_price * 100) if start_price != 0 else 0.0
+            # Percentage change using safe_float
+            start_price = safe_float(cw[0])
+            end_price = safe_float(close[i+window])
+            pct_change = ((end_price - start_price) / max(start_price, 1e-10) * 100)
             
             X.append([mean_price, std_price, max_price, min_price, mean_vol, pct_change])
             y.append(end_price)
@@ -290,28 +409,46 @@ def prepare_features(data, window=10):
         return None, None
 
 # ================= MODEL TRAINING =================
+# FIXED: Add better error handling and use safe_float for metrics
 def train_model(X, y):
     """Train RandomForest model and return metrics."""
     try:
-        if X is None or len(X) < 50:
+        if X is None or y is None or len(X) < 50:
+            return None, None, None, None
+        
+        # FIXED: Remove NaN/Inf values from training data
+        valid_idx = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        X_clean = X[valid_idx]
+        y_clean = y[valid_idx]
+        
+        if len(X_clean) < 50:
+            st.warning(f"Not enough valid training samples: {len(X_clean)}")
             return None, None, None, None
         
         # Train-test split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_clean, y_clean, 
+            test_size=0.2, 
+            random_state=42
+        )
         
         # Train model
-        model = RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42, n_jobs=-1)
+        model = RandomForestRegressor(
+            n_estimators=100, 
+            max_depth=15, 
+            random_state=42, 
+            n_jobs=-1
+        )
         model.fit(X_train, y_train)
         
         # Predictions
         y_pred = model.predict(X_test)
         
-        # Metrics - ensure proper conversion to Python scalars
+        # FIXED: Ensure proper conversion to Python scalars using safe_float
         mse_value = mean_squared_error(y_test, y_pred)
-        rmse = float(np.sqrt(mse_value).item() if hasattr(np.sqrt(mse_value), 'item') else np.sqrt(mse_value))
+        rmse = safe_float(np.sqrt(mse_value))
         r2_value = r2_score(y_test, y_pred)
-        r2 = float(r2_value.item() if hasattr(r2_value, 'item') else r2_value)
-        
+        r2 = safe_float(r2_value)
         train_samples = int(X_train.shape[0])
         
         return model, rmse, r2, train_samples
@@ -320,51 +457,65 @@ def train_model(X, y):
         return None, None, None, None
 
 # ================= PREDICTION =================
+# FIXED: Use safe_float for all conversions and handle edge cases
 def predict_prices(model, data, days=7):
     """Predict future prices with proper type handling."""
+    if model is None or data is None or data.empty:
+        return None
+    
     try:
-        if model is None:
-            return None
+        # FIXED: Ensure Close is 1D array
+        close_values = data['Close'].values
+        if isinstance(close_values, pd.DataFrame):
+            close_values = close_values.iloc[:, 0].values
+        close = np.array([safe_float(v) for v in close_values.flat], dtype=np.float64)
         
-        # Convert Close values to list of floats - handle numpy array properly
-        close_values = data['Close'].values.astype(np.float64)
-        close = [float(v) for v in close_values.flat]  # .flat flattens multidimensional arrays
-        
+        # FIXED: Handle Volume column safely
         if 'Volume' in data.columns:
-            volume_values = data['Volume'].values.astype(np.float64)
-            volume = [float(v) for v in volume_values.flat]
+            volume_values = data['Volume'].values
+            if isinstance(volume_values, pd.DataFrame):
+                volume_values = volume_values.iloc[:, 0].values
+            volume = np.array([safe_float(v, 1.0) for v in volume_values.flat], dtype=np.float64)
         else:
-            volume = [1.0] * len(close)
+            volume = np.ones(len(close), dtype=np.float64)
+        
+        # FIXED: Convert to Python lists for manipulation
+        close = close.tolist()
+        volume = volume.tolist()
+        
+        if len(close) < 10:
+            st.warning("Not enough historical data for prediction")
+            return None
         
         predictions = []
         
         for _ in range(days):
-            # Get last 10 values as lists
-            cw = close[-10:]
-            vol = volume[-10:]
+            # FIXED: Get last 10 values safely
+            cw = close[-10:] if len(close) >= 10 else close
+            vol = volume[-10:] if len(volume) >= 10 else volume
             
-            # Create numpy array for features explicitly
+            # FIXED: Create features with safe_float and use max() to prevent division by zero
             features_array = np.array([
-                float(np.mean(cw)),
-                float(np.std(cw)),
-                float(np.max(cw)),
-                float(np.min(cw)),
-                float(np.mean(vol)),
-                ((float(close[-1]) - float(cw[0])) / float(cw[0]) * 100) if float(cw[0]) != 0 else 0.0
+                safe_float(np.mean(cw)),
+                safe_float(np.std(cw)),
+                safe_float(np.max(cw)),
+                safe_float(np.min(cw)),
+                safe_float(np.mean(vol)),
+                (safe_float(close[-1]) - safe_float(cw[0])) / max(safe_float(cw[0]), 1e-10) * 100
             ], dtype=np.float64)
             
-            # Make prediction and convert result explicitly
+            # FIXED: Make prediction and convert result explicitly
             pred_result = model.predict(features_array.reshape(1, -1))[0]
+            pred = safe_float(pred_result)
             
-            # Ensure we get a Python float, not numpy scalar
-            if hasattr(pred_result, 'item'):
-                pred = float(pred_result.item())
-            else:
-                pred = float(pred_result)
+            # FIXED: Validate prediction is reasonable (not NaN or extreme)
+            if not np.isfinite(pred) or pred <= 0:
+                st.warning("Invalid prediction generated")
+                return None
             
             predictions.append(pred)
             close.append(pred)
-            volume.append(volume[-1])
+            volume.append(volume[-1] if volume else 1.0)
         
         return predictions
     except Exception as e:
@@ -374,31 +525,37 @@ def predict_prices(model, data, days=7):
         return None
 
 # ================= TRADING SIGNALS =================
+# FIXED: Add better error handling for signal generation
 def generate_signals(data):
     """Generate trading signals using multiple indicators."""
+    if data is None or data.empty:
+        return None
+    
     try:
         df = data.copy()
         df['Signal'] = 0
         
-        # MA Crossover Signal
-        ma_signal = np.where(df['MA20'] > df['MA50'], 1, -1)
+        # FIXED: Add NaN checks for MA signals
+        ma_signal = np.where(df['MA20'].notna() & df['MA50'].notna() & (df['MA20'] > df['MA50']), 1, -1)
         ma_signal = np.where(df['MA20'].isna() | df['MA50'].isna(), 0, ma_signal)
         
-        # RSI Signal
-        rsi_signal = np.where(df['RSI'] < 30, 1, np.where(df['RSI'] > 70, -1, 0))
+        # FIXED: Add NaN checks for RSI signals
+        rsi_signal = np.where(df['RSI'].notna() & (df['RSI'] < 30), 1, 
+                             np.where(df['RSI'].notna() & (df['RSI'] > 70), -1, 0))
         rsi_signal = np.where(df['RSI'].isna(), 0, rsi_signal)
         
-        # MACD Signal
-        macd_signal = np.where(
-            (df['MACD'] > df['Signal_Line']) & (df['MACD'].shift(1) <= df['Signal_Line'].shift(1)),
-            1,
-            np.where(
-                (df['MACD'] < df['Signal_Line']) & (df['MACD'].shift(1) >= df['Signal_Line'].shift(1)),
-                -1,
-                0
-            )
-        )
-        macd_signal = np.where(df['MACD'].isna() | df['Signal_Line'].isna(), 0, macd_signal)
+        # FIXED: Add NaN checks for MACD signals
+        mask_buy = (df['MACD'].notna() & df['Signal_Line'].notna() & 
+                    (df['MACD'] > df['Signal_Line']) & 
+                    (df['MACD'].shift(1).notna() & df['Signal_Line'].shift(1).notna()) &
+                    (df['MACD'].shift(1) <= df['Signal_Line'].shift(1)))
+        
+        mask_sell = (df['MACD'].notna() & df['Signal_Line'].notna() & 
+                     (df['MACD'] < df['Signal_Line']) & 
+                     (df['MACD'].shift(1).notna() & df['Signal_Line'].shift(1).notna()) &
+                     (df['MACD'].shift(1) >= df['Signal_Line'].shift(1)))
+        
+        macd_signal = np.where(mask_buy, 1, np.where(mask_sell, -1, 0))
         
         # Combine signals (majority voting)
         combined = ma_signal + rsi_signal + macd_signal
@@ -432,30 +589,49 @@ def main():
         st.divider()
         st.markdown("### 📊 Data Info")
         
-        # Fetch Data
+        # FIXED: Fetch Data with proper error handling
         data = fetch_data(days_history)
         
-        if data is None:
-            st.error("Failed to fetch data")
+        if data is None or data.empty:
+            st.error("❌ Failed to fetch data. Please refresh the page or try again later.")
+            st.info("This may be due to Yahoo Finance rate limiting. The app will retry automatically.")
             return
         
         st.info(f"📅 Data points: {len(data)}\n\n⏱️ Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Calculate Indicators
+    # FIXED: Calculate Indicators with proper error handling
     data = calculate_indicators(data)
-    data = generate_signals(data)
     
-    if data is None or len(data) < 50:
-        st.error("Not enough data for analysis")
+    if data is None or data.empty:
+        st.error("Failed to calculate indicators")
         return
     
-    # Get Latest Values
-    current_price = float(data['Close'].iloc[-1])
-    prev_price = float(data['Close'].iloc[-2])
-    price_change = current_price - prev_price
-    price_change_pct = (price_change / prev_price * 100) if prev_price != 0 else 0.0
-    volatility = float(data['Volatility'].iloc[-1]) if data['Volatility'].iloc[-1] > 0 else 0.0
-    rsi_value = float(data['RSI'].iloc[-1]) if not pd.isna(data['RSI'].iloc[-1]) else 50.0
+    data = generate_signals(data)
+    
+    if data is None or data.empty or len(data) < 50:
+        st.error("Not enough data for analysis (minimum 50 data points required)")
+        return
+    
+    # FIXED: Get Latest Values using safe_float to handle Series/scalar issues
+    try:
+        # FIXED: Use safe_float with .iloc to prevent Series conversion issues
+        current_price = safe_float(data['Close'].iloc[-1], 0)
+        prev_price = safe_float(data['Close'].iloc[-2], current_price)
+        
+        if current_price <= 0 or prev_price <= 0:
+            st.error("Invalid price data")
+            return
+        
+        price_change = current_price - prev_price
+        price_change_pct = (price_change / prev_price * 100) if prev_price != 0 else 0.0
+        volatility = safe_float(data['Volatility'].iloc[-1], 0.0)
+        volatility = max(volatility, 0.0)  # Ensure non-negative
+        rsi_value = safe_float(data['RSI'].iloc[-1], 50.0)
+        rsi_value = np.clip(rsi_value, 0, 100)  # Ensure RSI is 0-100
+        
+    except Exception as e:
+        st.error(f"Error extracting current metrics: {e}")
+        return
     
     # Metrics Row
     st.markdown("<div class='section-title'>📈 Current Metrics</div>", unsafe_allow_html=True)
@@ -501,7 +677,11 @@ def main():
     # Trading Signal
     st.markdown("<div class='section-title'>🎯 Trading Signal</div>", unsafe_allow_html=True)
     
-    latest_signal = int(data['Signal'].iloc[-1])
+    # FIXED: Use safe_float for Signal value extraction
+    try:
+        latest_signal = int(safe_float(data['Signal'].iloc[-1], 0))
+    except Exception:
+        latest_signal = 0
     
     if latest_signal == 1:
         signal_text = "BUY 🟢"
@@ -528,143 +708,153 @@ def main():
     # Charts Section
     st.markdown("<div class='section-title'>📊 Price Chart & Indicators</div>", unsafe_allow_html=True)
     
-    # Candlestick Chart
-    fig = go.Figure()
-    
-    fig.add_trace(go.Candlestick(
-        x=data['Date'],
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
-        name='BTC Price',
-        increasing_line_color='#00c853',
-        increasing_fillcolor='#00c853',
-        decreasing_line_color='#ff5252',
-        decreasing_fillcolor='#ff5252'
-    ))
-    
-    # Moving Averages
-    fig.add_trace(go.Scatter(
-        x=data['Date'],
-        y=data['MA20'],
-        name='MA20',
-        line=dict(color='#ffa500', width=2),
-        hovertemplate='<b>MA20</b><br>%{y:,.0f}<extra></extra>'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=data['Date'],
-        y=data['MA50'],
-        name='MA50',
-        line=dict(color='#1e90ff', width=2),
-        hovertemplate='<b>MA50</b><br>%{y:,.0f}<extra></extra>'
-    ))
-    
-    # Buy Signals
-    buy_signals = data[data['Signal'] == 1]
-    if len(buy_signals) > 0:
-        fig.add_trace(go.Scatter(
-            x=buy_signals['Date'],
-            y=buy_signals['Close'],
-            mode='markers',
-            marker=dict(symbol='triangle-up', color='#00c853', size=12, line=dict(color='#00c853', width=2)),
-            name='BUY Signal',
-            hovertemplate='<b>BUY</b><br>%{y:,.0f}<extra></extra>'
+    # FIXED: Add error handling for chart generation
+    try:
+        # Candlestick Chart
+        fig = go.Figure()
+        
+        fig.add_trace(go.Candlestick(
+            x=data['Date'],
+            open=data['Open'],
+            high=data['High'],
+            low=data['Low'],
+            close=data['Close'],
+            name='BTC Price',
+            increasing_line_color='#00c853',
+            increasing_fillcolor='#00c853',
+            decreasing_line_color='#ff5252',
+            decreasing_fillcolor='#ff5252'
         ))
-    
-    # Sell Signals
-    sell_signals = data[data['Signal'] == -1]
-    if len(sell_signals) > 0:
+        
+        # Moving Averages
         fig.add_trace(go.Scatter(
-            x=sell_signals['Date'],
-            y=sell_signals['Close'],
-            mode='markers',
-            marker=dict(symbol='triangle-down', color='#ff5252', size=12, line=dict(color='#ff5252', width=2)),
-            name='SELL Signal',
-            hovertemplate='<b>SELL</b><br>%{y:,.0f}<extra></extra>'
+            x=data['Date'],
+            y=data['MA20'],
+            name='MA20',
+            line=dict(color='#ffa500', width=2),
+            hovertemplate='<b>MA20</b><br>%{y:,.0f}<extra></extra>'
         ))
-    
-    fig.update_layout(
-        template="plotly_dark",
-        height=600,
-        xaxis_rangeslider_visible=False,
-        hovermode='x unified',
-        margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor='#0e1117',
-        plot_bgcolor='#161b22',
-        font=dict(color='#e6edf3', size=12)
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
+        
+        fig.add_trace(go.Scatter(
+            x=data['Date'],
+            y=data['MA50'],
+            name='MA50',
+            line=dict(color='#1e90ff', width=2),
+            hovertemplate='<b>MA50</b><br>%{y:,.0f}<extra></extra>'
+        ))
+        
+        # Buy Signals
+        buy_signals = data[data['Signal'] == 1]
+        if len(buy_signals) > 0:
+            fig.add_trace(go.Scatter(
+                x=buy_signals['Date'],
+                y=buy_signals['Close'],
+                mode='markers',
+                marker=dict(symbol='triangle-up', color='#00c853', size=12, line=dict(color='#00c853', width=2)),
+                name='BUY Signal',
+                hovertemplate='<b>BUY</b><br>%{y:,.0f}<extra></extra>'
+            ))
+        
+        # Sell Signals
+        sell_signals = data[data['Signal'] == -1]
+        if len(sell_signals) > 0:
+            fig.add_trace(go.Scatter(
+                x=sell_signals['Date'],
+                y=sell_signals['Close'],
+                mode='markers',
+                marker=dict(symbol='triangle-down', color='#ff5252', size=12, line=dict(color='#ff5252', width=2)),
+                name='SELL Signal',
+                hovertemplate='<b>SELL</b><br>%{y:,.0f}<extra></extra>'
+            ))
+        
+        fig.update_layout(
+            template="plotly_dark",
+            height=600,
+            xaxis_rangeslider_visible=False,
+            hovermode='x unified',
+            margin=dict(l=0, r=0, t=0, b=0),
+            paper_bgcolor='#0e1117',
+            plot_bgcolor='#161b22',
+            font=dict(color='#e6edf3', size=12)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error generating price chart: {e}")
     
     # RSI Chart
-    fig_rsi = go.Figure()
-    
-    fig_rsi.add_trace(go.Scatter(
-        x=data['Date'],
-        y=data['RSI'],
-        name='RSI (14)',
-        line=dict(color='#00d9ff', width=2),
-        hovertemplate='<b>RSI</b><br>%{y:.1f}<extra></extra>'
-    ))
-    
-    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
-    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
-    
-    fig_rsi.update_layout(
-        template="plotly_dark",
-        height=300,
-        xaxis_rangeslider_visible=False,
-        hovermode='x unified',
-        margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor='#0e1117',
-        plot_bgcolor='#161b22',
-        font=dict(color='#e6edf3', size=12),
-        yaxis=dict(range=[0, 100])
-    )
-    
-    st.plotly_chart(fig_rsi, use_container_width=True)
+    try:
+        fig_rsi = go.Figure()
+        
+        fig_rsi.add_trace(go.Scatter(
+            x=data['Date'],
+            y=data['RSI'],
+            name='RSI (14)',
+            line=dict(color='#00d9ff', width=2),
+            hovertemplate='<b>RSI</b><br>%{y:.1f}<extra></extra>'
+        ))
+        
+        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
+        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
+        
+        fig_rsi.update_layout(
+            template="plotly_dark",
+            height=300,
+            xaxis_rangeslider_visible=False,
+            hovermode='x unified',
+            margin=dict(l=0, r=0, t=0, b=0),
+            paper_bgcolor='#0e1117',
+            plot_bgcolor='#161b22',
+            font=dict(color='#e6edf3', size=12),
+            yaxis=dict(range=[0, 100])
+        )
+        
+        st.plotly_chart(fig_rsi, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error generating RSI chart: {e}")
     
     # MACD Chart
-    fig_macd = go.Figure()
-    
-    fig_macd.add_trace(go.Scatter(
-        x=data['Date'],
-        y=data['MACD'],
-        name='MACD',
-        line=dict(color='#00d9ff', width=2),
-        hovertemplate='<b>MACD</b><br>%{y:.4f}<extra></extra>'
-    ))
-    
-    fig_macd.add_trace(go.Scatter(
-        x=data['Date'],
-        y=data['Signal_Line'],
-        name='Signal Line',
-        line=dict(color='#ffa500', width=2),
-        hovertemplate='<b>Signal</b><br>%{y:.4f}<extra></extra>'
-    ))
-    
-    fig_macd.add_trace(go.Bar(
-        x=data['Date'],
-        y=data['MACD_Histogram'],
-        name='Histogram',
-        marker=dict(color=['#00c853' if x > 0 else '#ff5252' for x in data['MACD_Histogram']]),
-        hovertemplate='<b>Histogram</b><br>%{y:.4f}<extra></extra>'
-    ))
-    
-    fig_macd.update_layout(
-        template="plotly_dark",
-        height=300,
-        xaxis_rangeslider_visible=False,
-        hovermode='x unified',
-        margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor='#0e1117',
-        plot_bgcolor='#161b22',
-        font=dict(color='#e6edf3', size=12)
-    )
-    
-    st.plotly_chart(fig_macd, use_container_width=True)
+    try:
+        fig_macd = go.Figure()
+        
+        fig_macd.add_trace(go.Scatter(
+            x=data['Date'],
+            y=data['MACD'],
+            name='MACD',
+            line=dict(color='#00d9ff', width=2),
+            hovertemplate='<b>MACD</b><br>%{y:.4f}<extra></extra>'
+        ))
+        
+        fig_macd.add_trace(go.Scatter(
+            x=data['Date'],
+            y=data['Signal_Line'],
+            name='Signal Line',
+            line=dict(color='#ffa500', width=2),
+            hovertemplate='<b>Signal</b><br>%{y:.4f}<extra></extra>'
+        ))
+        
+        fig_macd.add_trace(go.Bar(
+            x=data['Date'],
+            y=data['MACD_Histogram'],
+            name='Histogram',
+            marker=dict(color=['#00c853' if x > 0 else '#ff5252' for x in data['MACD_Histogram']]),
+            hovertemplate='<b>Histogram</b><br>%{y:.4f}<extra></extra>'
+        ))
+        
+        fig_macd.update_layout(
+            template="plotly_dark",
+            height=300,
+            xaxis_rangeslider_visible=False,
+            hovermode='x unified',
+            margin=dict(l=0, r=0, t=0, b=0),
+            paper_bgcolor='#0e1117',
+            plot_bgcolor='#161b22',
+            font=dict(color='#e6edf3', size=12)
+        )
+        
+        st.plotly_chart(fig_macd, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error generating MACD chart: {e}")
     
     st.divider()
     
@@ -674,7 +864,7 @@ def main():
     with st.spinner("Training model..."):
         X, y = prepare_features(data)
         
-        if X is not None:
+        if X is not None and y is not None:
             model, rmse, r2, train_samples = train_model(X, y)
             
             if model is not None:
@@ -717,76 +907,84 @@ def main():
                     if predictions is not None and len(predictions) > 0:
                         try:
                             # ============= DATA PREPARATION =============
-                            # Work with clean data - drop NaN values
+                            # FIXED: Work with clean data - drop NaN values
                             clean_data = data[['Date', 'Close']].dropna()
                             
-                            # Convert dates to datetime
-                            hist_dates = pd.to_datetime(clean_data['Date']).values
-                            hist_prices = clean_data['Close'].values.astype(np.float64)
-                            
-                            # Generate future dates - use the last date from original data
-                            last_date = pd.to_datetime(data['Date'].iloc[-1])
-                            future_dates = [last_date + timedelta(days=i+1) for i in range(len(predictions))]
-                            
-                            # Ensure predictions are valid floats and filter out NaN
-                            pred_prices = [float(p) for p in predictions if p is not None]
-                            
-                            # Adjust future_dates to match predictions length
-                            future_dates = future_dates[:len(pred_prices)]
-                            
-                            # ============= STATISTICS =============
-                            col1, col2, col3, col4 = st.columns(4)
-                            
-                            with col1:
-                                st.metric(
-                                    "Current Price",
-                                    f"${current_price:,.0f}",
-                                    f"{price_change_pct:+.2f}%"
-                                )
-                            
-                            with col2:
-                                predicted_avg = float(np.mean(pred_prices)) if pred_prices else current_price
-                                st.metric(
-                                    "Avg Predicted",
-                                    f"${predicted_avg:,.0f}",
-                                    f"{((predicted_avg / current_price - 1) * 100):+.2f}%"
-                                )
-                            
-                            with col3:
-                                predicted_high = float(np.max(pred_prices)) if pred_prices else current_price
-                                st.metric(
-                                    "Highest Predicted",
-                                    f"${predicted_high:,.0f}",
-                                    f"{((predicted_high / current_price - 1) * 100):+.2f}%"
-                                )
-                            
-                            with col4:
-                                predicted_low = float(np.min(pred_prices)) if pred_prices else current_price
-                                st.metric(
-                                    "Lowest Predicted",
-                                    f"${predicted_low:,.0f}",
-                                    f"{((predicted_low / current_price - 1) * 100):+.2f}%"
-                                )
-                            
-                            # ============= PREDICTION TABLE =============
-                            try:
-                                pred_df = pd.DataFrame({
-                                    'Date': [d.strftime('%Y-%m-%d') for d in future_dates],
-                                    'Predicted Price': [f"${p:,.2f}" for p in pred_prices],
-                                    'Change from Today': [f"{((p / current_price - 1) * 100):+.2f}%" if current_price > 0 else "N/A" for p in pred_prices]
-                                })
+                            if clean_data.empty:
+                                st.warning("No clean data available for predictions")
+                            else:
+                                # FIXED: Convert dates to datetime
+                                hist_dates = pd.to_datetime(clean_data['Date']).values
+                                hist_prices = np.array([safe_float(p) for p in clean_data['Close'].values], dtype=np.float64)
                                 
-                                st.markdown("**📋 Detailed Predictions:**")
-                                st.dataframe(pred_df, use_container_width=True, hide_index=True)
-                            except Exception as table_err:
-                                st.warning(f"Could not display prediction table: {table_err}")
+                                # Generate future dates - use the last date from original data
+                                last_date = pd.to_datetime(safe_float(data['Date'].iloc[-1]) if isinstance(data['Date'].iloc[-1], (int, float)) else data['Date'].iloc[-1])
+                                future_dates = [last_date + timedelta(days=i+1) for i in range(len(predictions))]
                                 
+                                # FIXED: Ensure predictions are valid floats and filter out NaN/Inf
+                                pred_prices = [float(p) for p in predictions if p is not None and np.isfinite(p)]
+                                
+                                if not pred_prices:
+                                    st.warning("No valid predictions generated")
+                                else:
+                                    # Adjust future_dates to match predictions length
+                                    future_dates = future_dates[:len(pred_prices)]
+                                    
+                                    # ============= STATISTICS =============
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    
+                                    with col1:
+                                        st.metric(
+                                            "Current Price",
+                                            f"${current_price:,.0f}",
+                                            f"{price_change_pct:+.2f}%"
+                                        )
+                                    
+                                    with col2:
+                                        predicted_avg = float(np.mean(pred_prices)) if pred_prices else current_price
+                                        st.metric(
+                                            "Avg Predicted",
+                                            f"${predicted_avg:,.0f}",
+                                            f"{((predicted_avg / max(current_price, 1e-10) - 1) * 100):+.2f}%"
+                                        )
+                                    
+                                    with col3:
+                                        predicted_high = float(np.max(pred_prices)) if pred_prices else current_price
+                                        st.metric(
+                                            "Highest Predicted",
+                                            f"${predicted_high:,.0f}",
+                                            f"{((predicted_high / max(current_price, 1e-10) - 1) * 100):+.2f}%"
+                                        )
+                                    
+                                    with col4:
+                                        predicted_low = float(np.min(pred_prices)) if pred_prices else current_price
+                                        st.metric(
+                                            "Lowest Predicted",
+                                            f"${predicted_low:,.0f}",
+                                            f"{((predicted_low / max(current_price, 1e-10) - 1) * 100):+.2f}%"
+                                        )
+                                    
+                                    # ============= PREDICTION TABLE =============
+                                    try:
+                                        pred_df = pd.DataFrame({
+                                            'Date': [d.strftime('%Y-%m-%d') for d in future_dates],
+                                            'Predicted Price': [f"${p:,.2f}" for p in pred_prices],
+                                            'Change from Today': [f"{((p / max(current_price, 1e-10) - 1) * 100):+.2f}%" for p in pred_prices]
+                                        })
+                                        
+                                        st.markdown("**📋 Detailed Predictions:**")
+                                        st.dataframe(pred_df, use_container_width=True, hide_index=True)
+                                    except Exception as table_err:
+                                        st.warning(f"Could not display prediction table: {table_err}")
+                                        
                         except Exception as chart_err:
                             st.error(f"Error creating prediction chart: {chart_err}")
                             import traceback
                             st.text(traceback.format_exc())
                     else:
                         st.warning("⚠️ Could not generate predictions. Please try refreshing the page.")
+        else:
+            st.warning("⚠️ Unable to prepare features for model training. Please ensure you have sufficient data.")
     
     st.divider()
     
