@@ -261,9 +261,17 @@ def fetch_data(days, max_retries=3, backoff_factor=2):
             
             return df
         
-        except yf.utils.TickerMissingError:
-            st.error("Invalid ticker symbol")
-            return None
+        # FIXED: Removed invalid yfinance exception
+except Exception as e:
+    last_error = e
+    retry_count += 1
+    if retry_count < max_retries:
+        wait_time = backoff_factor ** retry_count
+        st.warning(f"API error (attempt {retry_count}/{max_retries}): {str(e)[:100]}. Retrying in {wait_time}s...")
+        time.sleep(wait_time)
+    else:
+        st.error(f"Failed to fetch data after {max_retries} retries: {last_error}")
+        return None
         except Exception as e:
             last_error = e
             retry_count += 1
