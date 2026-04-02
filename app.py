@@ -201,11 +201,11 @@ h1, h2, h3, h4, h5, h6 {
 }
 </style>
 """, unsafe_allow_html=True)
-
 # ================= DATA FETCHING =================
 @st.cache_data(ttl=3600)
 def fetch_data(days, max_retries=3, backoff_factor=2):
     """Fetch Bitcoin data from yfinance with retry logic and proper error handling."""
+    
     retry_count = 0
     last_error = None
     
@@ -215,60 +215,68 @@ def fetch_data(days, max_retries=3, backoff_factor=2):
             start = end - timedelta(days=days)
             
             df = yf.download(
-                "BTC-USD", 
-                start=start, 
-                end=end, 
+                "BTC-USD",
+                start=start,
+                end=end,
+                interval="1d",
+                auto_adjust=True,
                 progress=False,
                 threads=False
             )
-            
-            if df is None or df.empty:
-                st.warning("No data retrieved from Yahoo Finance. Retrying...")
-                retry_count += 1
-                time.sleep(backoff_factor ** retry_count)
-                continue
-            
-            if isinstance(df.index, pd.MultiIndex):
-                df.reset_index(inplace=True)
-            elif 'Date' not in df.columns and hasattr(df.index, 'name') and df.index.name == 'Date':
-                df.reset_index(inplace=True)
-            
-            if isinstance(df.get('Close'), pd.DataFrame):
-                df['Close'] = df['Close'].iloc[:, 0]
-            
-            dtype_map = {}
-            for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
-                if col in df.columns:
-                    dtype_map[col] = 'float64'
-            
-            if dtype_map:
-                df = df.astype(dtype_map)
-            
-            df = df.dropna(subset=['Close'])
-            
-            if len(df) < 20:
-                st.warning(f"Insufficient data points ({len(df)}). Retrying...")
-                retry_count += 1
-                time.sleep(backoff_factor ** retry_count)
-                continue
-            
-            return df
-        
-        # ❌ REMOVED invalid exception
-        # except yf.utils.TickerMissingError:
 
-        # ✅ FIXED: Proper single except block
+            # ✅ Check empty data
+            if df is None or df.empty:
+                st.warning("No data retrieved. Retrying...")
+                retry_count += 1
+                time.sleep(backoff_factor ** retry_count)
+                continue
+
+            # ✅ FIX: Flatten multi-index columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            # ✅ Reset index if needed
+            if 'Date' not in df.columns:
+                df.reset_index(inplace=True)
+
+            # ✅ FIX: Ensure Close column exists
+            if 'Close' not in df.columns:
+                st.error(f"Missing 'Close' column. Columns found: {list(df.columns)}")
+                return None
+
+            # ✅ Ensure Close is 1D
+            if isinstance(df['Close'], pd.DataFrame):
+                df['Close'] = df['Close'].iloc[:, 0]
+
+            # ✅ Convert numeric columns
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            # ✅ Drop NaN Close values
+            df = df.dropna(subset=['Close'])
+
+            if len(df) < 20:
+                st.warning(f"Not enough data ({len(df)}). Retrying...")
+                retry_count += 1
+                time.sleep(backoff_factor ** retry_count)
+                continue
+
+            return df
+
+        # ❌ REMOVED broken yf.utils.TickerMissingError
         except Exception as e:
             last_error = e
             retry_count += 1
+
             if retry_count < max_retries:
                 wait_time = backoff_factor ** retry_count
-                st.warning(f"API error (attempt {retry_count}/{max_retries}): {str(e)[:100]}. Retrying in {wait_time}s...")
+                st.warning(f"API error ({retry_count}/{max_retries}): {str(e)}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                st.error(f"Failed to fetch data after {max_retries} retries: {last_error}")
+                st.error(f"Failed after {max_retries} retries: {last_error}")
                 return None
-    
+
     return None
 # ================= TECHNICAL INDICATORS =================
 # FIXED: Add better error handling and ensure proper NaN handling
