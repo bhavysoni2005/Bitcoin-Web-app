@@ -203,7 +203,6 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 # ================= DATA FETCHING =================
-# FIXED: Add retry logic (3+ retries) and disable threading
 @st.cache_data(ttl=3600)
 def fetch_data(days, max_retries=3, backoff_factor=2):
     """Fetch Bitcoin data from yfinance with retry logic and proper error handling."""
@@ -215,33 +214,28 @@ def fetch_data(days, max_retries=3, backoff_factor=2):
             end = datetime.now()
             start = end - timedelta(days=days)
             
-            # FIXED: Set threads=False to avoid threading issues with yfinance
             df = yf.download(
                 "BTC-USD", 
                 start=start, 
                 end=end, 
                 progress=False,
-                threads=False  # FIXED: Disable threading to prevent API issues
+                threads=False
             )
             
-            # FIXED: Handle empty DataFrame safely
             if df is None or df.empty:
                 st.warning("No data retrieved from Yahoo Finance. Retrying...")
                 retry_count += 1
                 time.sleep(backoff_factor ** retry_count)
                 continue
             
-            # FIXED: Ensure we have proper data structure
             if isinstance(df.index, pd.MultiIndex):
                 df.reset_index(inplace=True)
             elif 'Date' not in df.columns and hasattr(df.index, 'name') and df.index.name == 'Date':
                 df.reset_index(inplace=True)
             
-            # FIXED: Ensure Close column is 1D (handle multi-index cases)
             if isinstance(df.get('Close'), pd.DataFrame):
                 df['Close'] = df['Close'].iloc[:, 0]
             
-            # Convert numeric columns to proper float64 type
             dtype_map = {}
             for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
                 if col in df.columns:
@@ -250,10 +244,9 @@ def fetch_data(days, max_retries=3, backoff_factor=2):
             if dtype_map:
                 df = df.astype(dtype_map)
             
-            # FIXED: Remove rows with NaN prices
             df = df.dropna(subset=['Close'])
             
-            if len(df) < 20:  # Need minimum data points
+            if len(df) < 20:
                 st.warning(f"Insufficient data points ({len(df)}). Retrying...")
                 retry_count += 1
                 time.sleep(backoff_factor ** retry_count)
@@ -261,17 +254,10 @@ def fetch_data(days, max_retries=3, backoff_factor=2):
             
             return df
         
-        # FIXED: Removed invalid yfinance exception
-except Exception as e:
-    last_error = e
-    retry_count += 1
-    if retry_count < max_retries:
-        wait_time = backoff_factor ** retry_count
-        st.warning(f"API error (attempt {retry_count}/{max_retries}): {str(e)[:100]}. Retrying in {wait_time}s...")
-        time.sleep(wait_time)
-    else:
-        st.error(f"Failed to fetch data after {max_retries} retries: {last_error}")
-        return None
+        # ❌ REMOVED invalid exception
+        # except yf.utils.TickerMissingError:
+
+        # ✅ FIXED: Proper single except block
         except Exception as e:
             last_error = e
             retry_count += 1
@@ -284,7 +270,6 @@ except Exception as e:
                 return None
     
     return None
-
 # ================= TECHNICAL INDICATORS =================
 # FIXED: Add better error handling and ensure proper NaN handling
 def calculate_indicators(data):
